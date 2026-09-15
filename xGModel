@@ -1,5 +1,6 @@
 import pandas as pd
 
-df = pd.read_parquet('PL Event Data 2024-2025.parquet')
+df = pd.read_parquet('sourceData/PL Event Data 2024-2025.parquet')
 
-df.head()
+print(df.head())
+
