@@ -1,0 +1,5 @@
+import pandas as pd
+
+df = pd.read_parquet('https://github.com/ITFCAnalytics/xG-Model/raw/7a7ddf705b76f246ad5596a5d324420e812017e7/PL%20Event%20Data%202024-2025.parquet')
+
+df.head()
