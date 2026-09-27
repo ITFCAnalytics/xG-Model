@@ -1,6 +1,643 @@
+#%%
+
+import ast
+import math
+import os
+import unicodedata
 import pandas as pd
+
+os.environ.setdefault('LOKY_MAX_CPU_COUNT', '1')
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+PITCH_LENGTH_YARDS = 105 * 1.0936133
+PITCH_WIDTH_YARDS = 68 * 1.0936133
+GOAL_WIDTH_YARDS = 7.32 * 1.0936133
+
+#%%
+
+# read source file for Premier League event data for 2024-2025 season
 
 df = pd.read_parquet('sourceData/PL Event Data 2024-2025.parquet')
 
+
+
+# The model only uses shot events. Filtering early also makes parsing much faster.
+#df = df[df['isShot'] == True].reset_index(drop=True).copy()
+
 print(df.head())
 
+#print(df.columns)
+
+#%%
+
+# parse the type, period and outcomeType columns from json strings
+
+def parse_obj(x):
+    if pd.isna(x):
+        return None
+    if isinstance(x, str):
+        return ast.literal_eval(x)
+    return x
+
+df['type'] = df['type'].apply(parse_obj)
+df['period'] = df['period'].apply(parse_obj)
+df['outcomeType'] = df['outcomeType'].apply(parse_obj)
+
+df['type_id'] = df['type'].str.get('value')
+df['type_name'] = df['type'].str.get('displayName')
+df['half_id'] = df['period'].str.get('value')
+df['half'] = df['period'].str.get('displayName')
+df['outcome_id'] = df['outcomeType'].str.get('value')
+df['outcome'] = df['outcomeType'].str.get('displayName')
+
+# parse the qualifiers column from json strings and flatten into separate columns
+
+def parse_qualifiers(x):
+    if pd.isna(x) or x == "[]":
+        return []
+    return ast.literal_eval(x)
+
+df["qualifiers"] = df["qualifiers"].apply(parse_qualifiers)
+
+# flatten the qualifiers into separate columns and concatenate to the main dataframe
+
+def flatten_qualifiers(qlist):
+    out = {}
+    for q in qlist:
+        name = q["type"]["displayName"]
+        out[name] = q.get("value", True)
+    return out
+
+qual_df = pd.DataFrame(df["qualifiers"].apply(flatten_qualifiers).tolist())
+df = pd.concat([df, qual_df], axis=1)
+
+#%%
+
+print(df.columns)
+
+#%%
+
+# Assign every verified ShotAssist pass to the next shot by the same team.
+shot_mask = df['isShot'].fillna(False).astype(bool)
+df['_next_shot_id'] = df['id'].where(shot_mask)
+df['_next_shot_id'] = df.groupby(
+    ['match_id', 'teamId'], sort=False
+)['_next_shot_id'].bfill()
+df['_event_order'] = range(len(df))
+
+shot_assist_mask = (
+    df['type_name'].eq('Pass')
+    & df['ShotAssist'].fillna(False).astype(bool)
+    & df['_next_shot_id'].notna()
+)
+assist_rows = df.loc[shot_assist_mask].copy()
+
+# If more than one marked assist precedes a shot, use the closest one.
+assist_rows = assist_rows.sort_values('_event_order').drop_duplicates(
+    ['match_id', 'teamId', '_next_shot_id'], keep='last'
+)
+
+def qualifier_flag(frame, column):
+    if column not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return frame[column].fillna(False).astype(bool)
+
+through_ball = qualifier_flag(assist_rows, 'Throughball')
+cross = qualifier_flag(assist_rows, 'Cross') & ~through_ball
+long_ball = qualifier_flag(assist_rows, 'Longball') & ~through_ball & ~cross
+layoff = qualifier_flag(assist_rows, 'LayOff') & ~through_ball & ~cross & ~long_ball
+head_pass = (
+    qualifier_flag(assist_rows, 'HeadPass')
+    & ~through_ball & ~cross & ~long_ball & ~layoff
+)
+chipped_pass = (
+    qualifier_flag(assist_rows, 'Chipped')
+    & ~through_ball & ~cross & ~long_ball & ~layoff & ~head_pass
+)
+
+assist_rows['hasShotAssist'] = True
+assist_rows['assistThroughBall'] = through_ball
+assist_rows['assistCross'] = cross
+assist_rows['assistLongBall'] = long_ball
+assist_rows['assistLayOff'] = layoff
+assist_rows['assistHeadPass'] = head_pass
+assist_rows['assistChippedPass'] = chipped_pass
+assist_rows['assistSimplePass'] = ~(
+    through_ball | cross | long_ball | layoff | head_pass | chipped_pass
+)
+
+assist_type_columns = [
+    'hasShotAssist',
+    'assistThroughBall',
+    'assistCross',
+    'assistLongBall',
+    'assistLayOff',
+    'assistHeadPass',
+    'assistChippedPass',
+    'assistSimplePass',
+]
+assist_lookup = assist_rows[
+    ['match_id', 'teamId', '_next_shot_id'] + assist_type_columns
+]
+df = df.merge(
+    assist_lookup,
+    how='left',
+    left_on=['match_id', 'teamId', 'id'],
+    right_on=['match_id', 'teamId', '_next_shot_id'],
+)
+df[assist_type_columns] = df[assist_type_columns].fillna(False).astype(bool)
+df = df.drop(columns=['_next_shot_id_x', '_next_shot_id_y', '_event_order'])
+
+# Proxy for a goalkeeper being beaten: the shooter completes a TakeOn in the
+# penalty area and takes a OneOnOne shot within five seconds.
+shot_mask = df['isShot'].fillna(False).astype(bool)
+event_time_seconds = df['expandedMinute'] * 60 + df['second'].fillna(0)
+player_event_groups = [df['match_id'], df['teamId'], df['playerId']]
+df['_next_player_shot_id'] = df['id'].where(shot_mask).groupby(
+    player_event_groups, sort=False
+).bfill()
+df['_next_player_shot_time'] = event_time_seconds.where(shot_mask).groupby(
+    player_event_groups, sort=False
+).bfill()
+seconds_to_next_shot = df['_next_player_shot_time'] - event_time_seconds
+one_on_one_shot_ids = set(
+    df.loc[
+        shot_mask & df['OneOnOne'].fillna(False).astype(bool), 'id'
+    ]
+)
+goalkeeper_takeon_mask = (
+    df['type_name'].eq('TakeOn')
+    & df['outcome'].eq('Successful')
+    & df['x'].ge(83)
+    & seconds_to_next_shot.between(0, 5)
+    & df['_next_player_shot_id'].isin(one_on_one_shot_ids)
+)
+goalkeeper_dribbled_shot_ids = set(
+    df.loc[goalkeeper_takeon_mask, '_next_player_shot_id']
+)
+df['isGoalkeeperDribbled'] = (
+    shot_mask & df['id'].isin(goalkeeper_dribbled_shot_ids)
+)
+df = df.drop(columns=['_next_player_shot_id', '_next_player_shot_time'])
+
+#%%
+
+# remove any accents from foreign player names
+
+def remove_accents(text):
+    if pd.isna(text):
+        return text  # keep NaN as is
+    text = str(text)  # convert to string if not
+    nfkd_form = unicodedata.normalize('NFKD', text)
+    return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+
+df['playerName'] = df['playerName'].apply(remove_accents)
+
+#print(df.columns)
+
+# create a new dataframe with only the relevant columns for xG model training
+
+shot_df = df[['id',
+ 'match_id',
+ 'teamId',
+ 'type_name',
+ 'outcome',
+ 'playerId',
+ 'playerName',
+ 'hasShotAssist',
+ 'assistThroughBall',
+ 'assistCross',
+ 'assistLongBall',
+ 'assistLayOff',
+ 'assistHeadPass',
+ 'assistChippedPass',
+ 'assistSimplePass',
+ 'isGoalkeeperDribbled',
+ 'x',
+ 'y',
+ 'endX',
+ 'endY',
+ 'blockedX',
+ 'blockedY',
+ 'isShot',
+ 'isGoal',
+ 'RegularPlay',
+ 'FastBreak',
+ 'Volley',
+ 'FirstTouch',
+ 'FromCorner',
+ 'BigChance',
+ 'OtherBodyPart',
+ 'IndividualPlay',
+ 'OneOnOne',
+ 'Penalty',
+ 'LeftFoot',
+ 'RightFoot',
+ 'Head',
+ 'Blocked']]
+
+# only use shots in the shot_df
+
+shot_df = shot_df[shot_df['isShot'] == True]
+
+# Every assisted shot must have exactly one mutually exclusive assist type.
+assist_type_only_columns = [
+    'assistThroughBall',
+    'assistCross',
+    'assistLongBall',
+    'assistLayOff',
+    'assistHeadPass',
+    'assistChippedPass',
+    'assistSimplePass',
+]
+assist_type_count = shot_df[assist_type_only_columns].sum(axis=1)
+assert assist_type_count.eq(shot_df['hasShotAssist'].astype(int)).all()
+print('\nShot assist types')
+print(shot_df.loc[shot_df['hasShotAssist'], assist_type_only_columns].sum())
+goalkeeper_dribbled_mask = shot_df['isGoalkeeperDribbled'].astype(bool)
+print(f'\nGoalkeeper-dribbled shots: {goalkeeper_dribbled_mask.sum()}')
+print(
+    'Goalkeeper-dribbled conversion rate: '
+    f"{shot_df.loc[goalkeeper_dribbled_mask, 'isGoal'].fillna(False).mean():.4f}"
+)
+
+# create custom shot metrics
+# Opta coordinates are percentages of a 105 m x 68 m pitch
+
+# create a new column to indicate if the shot was taken with either foot
+
+shot_df = shot_df.copy()
+shot_df['isFooted'] = (
+    shot_df['LeftFoot'].fillna(False).astype(bool)
+    | shot_df['RightFoot'].fillna(False).astype(bool)
+)
+
+# calculate the distance in yards from the shot location to the centre of the goal
+distance_to_goal_line_yards = (
+    (100 - shot_df['x']) / 100 * PITCH_LENGTH_YARDS
+)
+distance_to_goal_centre_yards = (
+    (50 - shot_df['y']) / 100 * PITCH_WIDTH_YARDS
+)
+shot_df['distanceToGoal'] = (
+    distance_to_goal_line_yards ** 2 + distance_to_goal_centre_yards ** 2
+) ** 0.5
+
+# calculate the angle of the shot from the shot location to the goal
+
+def calculate_goal_angle(row):
+    """Return the angle in radians between the shot location and the goalposts."""
+    if pd.isna(row['x']) or pd.isna(row['y']):
+        return float('nan')
+
+    distance_to_goal_line = (100 - row['x']) / 100 * PITCH_LENGTH_YARDS
+    shot_y = row['y'] / 100 * PITCH_WIDTH_YARDS
+    goal_centre_y = PITCH_WIDTH_YARDS / 2
+    half_goal_width = GOAL_WIDTH_YARDS / 2
+
+    left_post = (distance_to_goal_line, goal_centre_y - half_goal_width - shot_y)
+    right_post = (distance_to_goal_line, goal_centre_y + half_goal_width - shot_y)
+    cross_product = abs(
+        left_post[0] * right_post[1] - left_post[1] * right_post[0]
+    )
+    dot_product = (
+        left_post[0] * right_post[0] + left_post[1] * right_post[1]
+    )
+    return math.atan2(cross_product, dot_product)
+
+shot_df['goalAngle'] = shot_df.apply(calculate_goal_angle, axis=1)
+
+# calculate the distance from the shot location to the blocked location
+
+x_to_block_yards = (
+    (shot_df['blockedX'] - shot_df['x']) / 100 * PITCH_LENGTH_YARDS
+)
+y_to_block_yards = (
+    (shot_df['blockedY'] - shot_df['y']) / 100 * PITCH_WIDTH_YARDS
+)
+distance_to_block_yards = (x_to_block_yards ** 2 + y_to_block_yards ** 2) ** 0.5
+
+is_blocked = shot_df['Blocked'].fillna(False).astype(bool)
+shot_df['isBlockedWithin3Yards'] = (
+    is_blocked & distance_to_block_yards.notna() & distance_to_block_yards.le(3)
+)
+shot_df['blockedDistanceYards'] = distance_to_block_yards.where(
+    shot_df['isBlockedWithin3Yards']
+)
+
+print(shot_df.head())
+# %%
+
+shot_df = shot_df[['id',
+ 'match_id',
+ 'teamId',
+ 'type_name',
+ 'outcome',
+ 'playerId',
+ 'playerName',
+
+ 'hasShotAssist',
+ 'assistThroughBall',
+ 'assistCross',
+ 'assistLongBall',
+ 'assistLayOff',
+ 'assistHeadPass',
+ 'assistChippedPass',
+ 'assistSimplePass',
+ 'isGoalkeeperDribbled',
+
+ 'blockedX',
+ 'blockedY',
+ 'Blocked',
+
+ 'x',
+ 'y',
+
+ 'goalAngle',
+ 'isBlockedWithin3Yards',
+ 'blockedDistanceYards',
+ 'distanceToGoal',
+
+ 'isShot',
+ 'isGoal',
+
+ 'RegularPlay',
+ 'FastBreak',
+ 'FromCorner',
+
+ 'isFooted',
+ 'Head',
+ 'OtherBodyPart',
+
+ 'Volley',
+ 'FirstTouch',
+
+ 'BigChance',
+
+ 'IndividualPlay',
+ 'OneOnOne',
+ 'Penalty']]
+
+shot_df.head()
+# %%
+
+base_columns = ['id',
+ 'match_id',
+ 'teamId',
+ 'type_name',
+ 'outcome',
+ 'playerId',
+ 'playerName']
+
+target_columns = ['isGoal']
+
+continuous_feature_columns = [
+    'goalAngle',
+    'distanceToGoal',
+    'x',
+    'y']
+
+binary_feature_columns = [
+    'RegularPlay',
+    'FastBreak',
+    'FromCorner',
+    'isFooted',
+    'Head',
+    'OtherBodyPart',
+    'Volley',
+    'FirstTouch',
+    'BigChance',
+    'IndividualPlay',
+    'OneOnOne',
+    'Penalty',
+    'hasShotAssist',
+    'assistThroughBall',
+    'assistCross',
+    'assistLongBall',
+    'assistLayOff',
+    'assistHeadPass',
+    'assistChippedPass',
+    'assistSimplePass',
+    'isGoalkeeperDribbled']
+
+#%%
+
+feature_columns = continuous_feature_columns + binary_feature_columns
+
+MINIMUM_BLOCK_ADJUSTMENT = 0.25
+
+def calculate_block_adjustment(shots):
+    """Return a smooth multiplier from 0.25 to 1 based on block distance."""
+    adjustment = pd.Series(1.0, index=shots.index)
+    close_block = shots['isBlockedWithin3Yards'].fillna(False).astype(bool)
+    normalized_distance = (
+        pd.to_numeric(shots['blockedDistanceYards'], errors='coerce') / 3
+    ).clip(lower=0, upper=1)
+    adjustment.loc[close_block] = (
+        MINIMUM_BLOCK_ADJUSTMENT
+        + (1 - MINIMUM_BLOCK_ADJUSTMENT) * normalized_distance.loc[close_block]
+    )
+    return adjustment
+
+#%%
+
+shot_df['isGoal'] = shot_df['isGoal'].fillna(False).astype(int)
+
+#%%
+
+shot_df[binary_feature_columns] = (
+    shot_df[binary_feature_columns].fillna(False).astype(bool).astype(int)
+)
+
+# %%
+
+# Train an xG model and evaluate it on matches the model has not seen.
+
+X = shot_df[feature_columns].copy()
+X[continuous_feature_columns] = X[continuous_feature_columns].apply(
+    pd.to_numeric, errors='coerce'
+)
+# Qualifiers are present as True and absent as NaN in the source data.
+X[binary_feature_columns] = (
+    X[binary_feature_columns].fillna(False).astype(bool).astype(int)
+)
+y = shot_df['isGoal'].fillna(False).astype(int)
+groups = shot_df['match_id']
+
+splitter = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+train_indices, test_indices = next(splitter.split(X, y, groups=groups))
+X_train = X.iloc[train_indices]
+X_test = X.iloc[test_indices]
+y_train = y.iloc[train_indices]
+y_test = y.iloc[test_indices]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('continuous', Pipeline([
+            ('imputer', SimpleImputer(strategy='median')),
+            ('scaler', StandardScaler()),
+        ]), continuous_feature_columns),
+        ('binary', SimpleImputer(strategy='constant', fill_value=0),
+         binary_feature_columns),
+    ],
+    remainder='drop',
+)
+
+xg_model = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', HistGradientBoostingClassifier(
+        max_iter=180,
+        learning_rate=0.04,
+        max_leaf_nodes=8,
+        min_samples_leaf=10,
+        l2_regularization=3,
+        random_state=42,
+    )),
+])
+
+def predict_xg(model, features, penalty_rate, goalkeeper_dribbled_rate):
+    """Predict regular shots and apply learned rates to distinct shot classes."""
+    probabilities = model.predict_proba(features)[:, 1]
+    penalties = features['Penalty'].eq(1).to_numpy()
+    goalkeeper_dribbled = features['isGoalkeeperDribbled'].eq(1).to_numpy()
+    probabilities[penalties] = penalty_rate
+    probabilities[goalkeeper_dribbled & ~penalties] = goalkeeper_dribbled_rate
+    return probabilities
+
+train_penalty_mask = X_train['Penalty'].eq(1)
+train_goalkeeper_dribbled_mask = X_train['isGoalkeeperDribbled'].eq(1)
+training_penalty_rate = y_train.loc[train_penalty_mask].mean()
+training_goalkeeper_dribbled_rate = y_train.loc[
+    train_goalkeeper_dribbled_mask
+].mean()
+train_regular_shot_mask = ~(
+    train_penalty_mask | train_goalkeeper_dribbled_mask
+)
+xg_model.fit(
+    X_train.loc[train_regular_shot_mask],
+    y_train.loc[train_regular_shot_mask],
+)
+
+test_base_xg = predict_xg(
+    xg_model,
+    X_test,
+    training_penalty_rate,
+    training_goalkeeper_dribbled_rate,
+)
+test_block_adjustment = calculate_block_adjustment(
+    shot_df.iloc[test_indices]
+).to_numpy()
+test_xg = test_base_xg * test_block_adjustment
+test_predictions = (test_xg >= 0.5).astype(int)
+
+calibration_table = pd.DataFrame({
+    'actual': y_test,
+    'predicted': test_xg,
+})
+calibration_table['decile'] = pd.qcut(
+    calibration_table['predicted'], q=10, duplicates='drop'
+)
+calibration_table = calibration_table.groupby(
+    'decile', observed=True
+).agg(
+    shots=('actual', 'size'),
+    mean_xg=('predicted', 'mean'),
+    goal_rate=('actual', 'mean'),
+)
+mean_calibration_error = (
+    (calibration_table['mean_xg'] - calibration_table['goal_rate']).abs()
+    * calibration_table['shots']
+).sum() / calibration_table['shots'].sum()
+
+model_metrics = {
+    'roc_auc': roc_auc_score(y_test, test_xg),
+    'log_loss': log_loss(y_test, test_xg),
+    'brier_score': brier_score_loss(y_test, test_xg),
+    'accuracy': accuracy_score(y_test, test_predictions),
+    'precision': precision_score(y_test, test_predictions, zero_division=0),
+    'recall': recall_score(y_test, test_predictions, zero_division=0),
+    'mean_calibration_error': mean_calibration_error,
+}
+
+print('\nHoldout model metrics')
+for metric_name, metric_value in model_metrics.items():
+    print(f'{metric_name}: {metric_value:.4f}')
+print('confusion_matrix:')
+print(confusion_matrix(y_test, test_predictions))
+print('calibration_by_xG_decile:')
+print(calibration_table)
+
+penalty_mask = X['Penalty'].eq(1)
+goalkeeper_model_mask = X['isGoalkeeperDribbled'].eq(1)
+penalty_conversion_rate = y.loc[penalty_mask].mean()
+goalkeeper_dribbled_conversion_rate = y.loc[goalkeeper_model_mask].mean()
+regular_shot_mask = ~(penalty_mask | goalkeeper_model_mask)
+# Fit ordinary shots separately from penalties and goalkeeper-dribbled chances.
+xg_model.fit(X.loc[regular_shot_mask], y.loc[regular_shot_mask])
+shot_df['baseXG'] = predict_xg(
+    xg_model,
+    X,
+    penalty_conversion_rate,
+    goalkeeper_dribbled_conversion_rate,
+)
+shot_df['blockAdjustment'] = calculate_block_adjustment(shot_df)
+shot_df['xG'] = shot_df['baseXG'] * shot_df['blockAdjustment']
+
+goalkeeper_counterfactual_features = X.loc[goalkeeper_model_mask].copy()
+goalkeeper_counterfactual_features['isGoalkeeperDribbled'] = 0
+goalkeeper_counterfactual_xg = predict_xg(
+    xg_model,
+    goalkeeper_counterfactual_features,
+    penalty_conversion_rate,
+    goalkeeper_dribbled_conversion_rate,
+)
+goalkeeper_dribble_xg_lift = (
+    shot_df.loc[goalkeeper_model_mask, 'baseXG'].to_numpy()
+    - goalkeeper_counterfactual_xg
+).mean()
+
+penalty_mean_xg = shot_df.loc[penalty_mask, 'xG'].mean()
+high_value_shot_count = shot_df['xG'].ge(0.5).sum()
+print(f'penalty conversion rate: {penalty_conversion_rate:.4f}')
+print(f'penalty mean xG: {penalty_mean_xg:.4f}')
+print(f'shots with at least 0.50 xG: {high_value_shot_count}')
+print(f'goalkeeper-dribble mean base xG lift: {goalkeeper_dribble_xg_lift:.4f}')
+
+# Model tests: probability bounds, target separation, split integrity and skill.
+assert shot_df['xG'].between(0, 1).all()
+assert shot_df['xG'].notna().all()
+assert shot_df['baseXG'].between(0, 1).all()
+assert shot_df['blockAdjustment'].between(MINIMUM_BLOCK_ADJUSTMENT, 1).all()
+assert shot_df.loc[
+    ~shot_df['isBlockedWithin3Yards'].astype(bool), 'blockAdjustment'
+].eq(1).all()
+assert shot_df['xG'].le(shot_df['baseXG']).all()
+assert 'isGoal' not in feature_columns
+assert 'isShot' not in feature_columns
+assert {'isBlockedWithin3Yards', 'blockedDistanceYards'}.isdisjoint(feature_columns)
+assert goalkeeper_model_mask.sum() > 0
+assert goalkeeper_dribble_xg_lift > 0
+assert set(groups.iloc[train_indices]).isdisjoint(set(groups.iloc[test_indices]))
+assert model_metrics['roc_auc'] > 0.5
+assert model_metrics['brier_score'] < y_test.mean() * (1 - y_test.mean())
+assert abs(penalty_mean_xg - penalty_conversion_rate) < 1e-12
+
+print('\nModel tests passed')
+print(shot_df[
+    base_columns + feature_columns + target_columns
+    + ['baseXG', 'blockAdjustment', 'xG']
+].head())

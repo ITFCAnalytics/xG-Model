@@ -1,2 +1,7 @@
 pandas
 pyarrow
+scikit-learn
+selenium
+bs4
+ast
+unicode
